@@ -76,22 +76,26 @@ function cSet(key, v, ttl = 5 * 60 * 1000) {
 // § 3  TDX fetch helpers
 // ═══════════════════════════════════════════════
 
-// 搜尋站牌（OData contains 模糊搜）—— 5-min cache
-async function tdxSearchStops(city, q, tok) {
-  const key = `stops:${city}:${q}`;
+// 取得城市所有站牌 —— 快取 10 分鐘（資料量大但穩定）
+async function tdxAllStops(city, tok) {
+  const key = `allstops:${city}`;
   const hit = cGet(key);
   if (hit) return hit;
 
-  // OData filter: StopName/Zh_tw 含有 q
-  const filter = `contains(StopName%2FZh_tw%2C'${encodeURIComponent(q)}')`;
-  const url    = `${TDX_BUS}/Stop/City/${city}?%24filter=${filter}&%24top=30&%24format=JSON`;
-
-  // 用不帶 encode 的方式拼接更穩定
-  const raw = `${TDX_BUS}/Stop/City/${city}?$filter=contains(StopName/Zh_tw,'${encodeURIComponent(q)}')&$top=30&$format=JSON`;
-
-  const { data } = await axios.get(raw, { headers: auth(tok) });
-  cSet(key, data);
+  // 不帶任何 filter，直接抓全部，TDX 預設回傳上限約 10000 筆
+  const url = `${TDX_BUS}/Stop/City/${city}?$top=10000&$format=JSON`;
+  const { data } = await axios.get(url, { headers: auth(tok) });
+  cSet(key, data, 10 * 60 * 1000); // 10-min cache
   return data;
+}
+
+// 搜尋站牌（在後端過濾，避免 OData 中文編碼問題）
+async function tdxSearchStops(city, q, tok) {
+  const allStops = await tdxAllStops(city, tok);
+  // 後端直接 filter，完全不依賴 OData contains
+  return allStops.filter(s =>
+    (s.StopName?.Zh_tw ?? "").includes(q)
+  );
 }
 
 // 取得站名的即時 ETA —— 不 cache（即時資料）
