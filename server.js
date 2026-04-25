@@ -323,3 +323,28 @@ app.get("/health/token", async (_, res) => {
 app.listen(PORT, () =>
   console.log(`🚌 BusGo v2 → http://localhost:${PORT}`)
 );
+
+// ── 診斷端點 ──────────────────────────────────
+app.get("/debug/eta", async (req, res) => {
+  const { name = "臺北車站", city = "Taipei" } = req.query;
+  try {
+    const tok = await getToken();
+    const url = `${TDX_BUS}/EstimatedTimeOfArrival/City/${city}/StopName/${encodeURIComponent(name)}?$top=3&$format=JSON`;
+    const { data, status } = await axios.get(url, { headers: auth(tok) });
+    res.json({ url, httpStatus: status, count: Array.isArray(data) ? data.length : "not_array", sample: Array.isArray(data) ? data.slice(0,2) : data });
+  } catch(e) {
+    res.json({ error: e.message, httpStatus: e.response?.status, body: e.response?.data });
+  }
+});
+
+app.get("/debug/stop", async (req, res) => {
+  const { city = "Taipei" } = req.query;
+  try {
+    const tok = await getToken();
+    const url = `${TDX_BUS}/Stop/City/${city}?$top=3&$format=JSON`;
+    const { data, status } = await axios.get(url, { headers: auth(tok) });
+    res.json({ url, httpStatus: status, count: Array.isArray(data) ? data.length : "not_array", sample: Array.isArray(data) ? data.slice(0,2) : data });
+  } catch(e) {
+    res.json({ error: e.message, httpStatus: e.response?.status, body: e.response?.data });
+  }
+});
