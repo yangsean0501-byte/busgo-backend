@@ -121,37 +121,36 @@ async function tdxStopOfRoute(city, routeName, tok) {
 
 // ═══════════════════════════════════════════════
 // § 4  GET /api/search-stop
-//   用站名文字搜尋站牌（前端 autocomplete）
+//   用 ETA 端點驗證站名（最穩定，不依賴 OData filter）
 //
 //   Query: q=台北車站, city=Taipei
-//   Return: { results: [{ stopName, stopUID, city, position }] }
+//   Return: { results: [{ stopName, city }] }
 // ═══════════════════════════════════════════════
 app.get("/api/search-stop", async (req, res) => {
   const { q = "", city = "Taipei" } = req.query;
+  const name = q.trim();
 
-  if (q.trim().length === 0)
+  if (name.length === 0)
     return res.status(400).json({ error: "q is required" });
 
   try {
-    const tok   = await getToken();
-    const stops = await tdxSearchStops(city, q.trim(), tok);
+    const tok = await getToken();
 
-    // 去重（同站名多筆）
-    const seen = new Set();
-    const results = [];
-    for (const s of stops) {
-      const name = s.StopName?.Zh_tw ?? "";
-      if (!name || seen.has(name)) continue;
-      seen.add(name);
-      results.push({
-        stopName: name,
-        stopUID:  s.StopUID  ?? "",
-        city,
-        position: s.StopPosition ?? null,
-      });
+    // 用 ETA 端點驗證站名是否存在（有資料 = 站名正確）
+    const url = `${TDX_BUS}/EstimatedTimeOfArrival/City/${city}/StopName/${encodeURIComponent(name)}?$top=1&$format=JSON`;
+    let valid = false;
+    try {
+      const { data } = await axios.get(url, { headers: auth(tok) });
+      valid = Array.isArray(data) && data.length > 0;
+    } catch (e) {
+      valid = false;
     }
 
-    res.json({ results, q, city });
+    if (valid) {
+      res.json({ results: [{ stopName: name, city }], q, city });
+    } else {
+      res.json({ results: [], q, city });
+    }
   } catch (err) {
     console.error("[search-stop]", err.response?.status, err.message);
     res.status(500).json({ error: "TDX 站牌查詢失敗", detail: err.message });
