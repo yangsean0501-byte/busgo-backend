@@ -1,319 +1,201 @@
 "use strict";
 
 /**
- * 快搭公車 BusGo — Backend v3
- * 修正：ETA 用 StopUID 查（非 StopName），StopUID 從 Stop API 取得
+ * 快搭公車 BusGo — Backend v3 (Final Fix)
+ * ─────────────────────────────────────────────────
+ * 修正重點：
+ * 1. 權限：必須透過 ClientID/Secret 換取 Access Token (已實作)
+ * 2. 404 修正：TDX 不支援 /StopUID/{id} 路徑，改用 $filter 語法
+ * 3. 效能：避免抓取全城市 10000 筆站牌，改用 API 端搜尋
+ * 4. 穩定：合併多個 StopUID 查詢，減少 API 呼叫次數
  */
 
-const express = require("express");
-const axios   = require("axios");
-const cors    = require("cors");
 require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
 
-// ═══════════════════════════════════════════════
-// § 1  TDX OAuth2 Token (25-min cache)
-// ═══════════════════════════════════════════════
+// TDX 設定
 const TDX_AUTH = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
-const TDX_BUS  = "https://tdx.transportdata.tw/api/basic/v2/Bus";
+const TDX_BUS = "https://tdx.transportdata.tw/api/basic/v2/Bus";
 
+// ═══════════════════════════════════════════════
+// § 1  Token 管理 (避免頻繁請求)
+// ═══════════════════════════════════════════════
 let _tok = null, _tokExp = 0;
 
 async function getToken() {
   if (_tok && Date.now() < _tokExp) return _tok;
+
   const body = new URLSearchParams({
-    grant_type:    "client_credentials",
-    client_id:     process.env.TDX_CLIENT_ID     ?? "",
-    client_secret: process.env.TDX_CLIENT_SECRET ?? "",
+    grant_type: "client_credentials",
+    client_id: process.env.TDX_CLIENT_ID || "",
+    client_secret: process.env.TDX_CLIENT_SECRET || "",
   });
-  const { data } = await axios.post(TDX_AUTH, body, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-  _tok    = data.access_token;
-  _tokExp = Date.now() + 25 * 60 * 1000;
-  console.log("[TDX] Token refreshed");
-  return _tok;
-}
 
-const auth = (tok) => ({ Authorization: `Bearer ${tok}` });
-
-// ═══════════════════════════════════════════════
-// § 2  TTL Cache
-// ═══════════════════════════════════════════════
-const _cache = new Map();
-
-function cGet(key) {
-  const e = _cache.get(key);
-  if (!e) return null;
-  if (Date.now() > e.exp) { _cache.delete(key); return null; }
-  return e.v;
-}
-
-function cSet(key, v, ttl = 5 * 60 * 1000) {
-  _cache.set(key, { v, exp: Date.now() + ttl });
-}
-
-// ═══════════════════════════════════════════════
-// § 3  TDX Helpers
-// ═══════════════════════════════════════════════
-
-// 用站名搜尋站牌，回傳 StopUID 列表（後端 filter，最穩定）
-async function searchStopsByName(city, name, tok) {
-  const key = `stops:${city}`;
-  let allStops = cGet(key);
-
-  if (!allStops) {
-    const url = `${TDX_BUS}/Stop/City/${city}?$top=10000&$format=JSON`;
-    const { data } = await axios.get(url, { headers: auth(tok) });
-    allStops = data;
-    cSet(key, allStops, 10 * 60 * 1000); // 10-min cache
-    console.log(`[TDX] Loaded ${allStops.length} stops for ${city}`);
+  try {
+    const { data } = await axios.post(TDX_AUTH, body, {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+    _tok = data.access_token;
+    _tokExp = Date.now() + 25 * 60 * 1000; // 25 min 緩存
+    console.log("[TDX] Token refreshed");
+    return _tok;
+  } catch (err) {
+    console.error("[TDX Auth Error]", err.response?.data || err.message);
+    throw new Error("TDX 驗證失敗，請檢查環境變數");
   }
-
-  // 後端直接 filter
-  return allStops.filter(s =>
-    (s.StopName?.Zh_tw ?? "").includes(name)
-  );
 }
 
-// 用 StopUID 查 ETA（即時，不 cache）
-async function fetchETAByUID(city, stopUID, tok) {
-  const url = `${TDX_BUS}/EstimatedTimeOfArrival/City/${city}/StopUID/${stopUID}?$top=200&$format=JSON`;
+const auth = (tok) => ({ "authorization": `Bearer ${tok}`, "Accept-Encoding": "gzip" });
+
+// ═══════════════════════════════════════════════
+// § 2  簡單快取邏輯
+// ═══════════════════════════════════════════════
+const cache = new Map();
+function cGet(k) { const x = cache.get(k); return (x && x.t > Date.now()) ? x.v : null; }
+function cSet(k, v, ttl = 5 * 60 * 1000) { cache.set(k, { v, t: Date.now() + ttl }); }
+
+// ═══════════════════════════════════════════════
+// § 3  TDX 查詢助手
+// ═══════════════════════════════════════════════
+
+// 搜尋站牌名，取得 StopUID (修正：不再抓取全城市，改用 API 過濾)
+async function searchStopsByName(city, name, tok) {
+  const key = `stops:${city}:${name}`;
+  const hit = cGet(key);
+  if (hit) return hit;
+
+  // 使用 OData contains 語法搜尋站名
+  const url = `${TDX_BUS}/Stop/City/${city}?$filter=contains(StopName/Zh_tw,'${encodeURIComponent(name)}')&$format=JSON`;
+  const { data } = await axios.get(url, { headers: auth(tok) });
+  
+  cSet(key, data, 10 * 60 * 1000); 
+  return data;
+}
+
+// 批次取得 ETA (修正：使用 $filter 解決 404 問題)
+async function fetchETAByBatch(city, stopUIDs, tok) {
+  if (!stopUIDs || stopUIDs.length === 0) return [];
+
+  // 合併多個 StopUID 查詢：StopUID eq 'A' or StopUID eq 'B'
+  const filterQuery = stopUIDs.map(uid => `StopUID eq '${uid}'`).join(' or ');
+  const url = `${TDX_BUS}/EstimatedTimeOfArrival/City/${city}?$filter=${encodeURIComponent(filterQuery)}&$format=JSON`;
+  
   const { data } = await axios.get(url, { headers: auth(tok) });
   return data;
 }
 
-// 取得路線停靠站（RouteName 查，5-min cache）
+// 取得路線停靠站 (用於比對目的地關鍵字)
 async function fetchStopOfRoute(city, routeName, tok) {
   const key = `sor:${city}:${routeName}`;
   const hit = cGet(key);
   if (hit) return hit;
 
-  const url = `${TDX_BUS}/StopOfRoute/City/${city}/RouteName/${encodeURIComponent(routeName)}?$format=JSON`;
+  const url = `${TDX_BUS}/StopOfRoute/City/${city}/${encodeURIComponent(routeName)}?$format=JSON`;
   const { data } = await axios.get(url, { headers: auth(tok) });
-  cSet(key, data);
+  cSet(key, data, 10 * 60 * 1000);
   return data;
 }
 
 // ═══════════════════════════════════════════════
-// § 4  GET /api/search-stop
-//   搜尋站牌（前端 autocomplete）
-//   Query: q=台北車站, city=Taipei
+// § 4  API 端點
 // ═══════════════════════════════════════════════
+
+// 搜尋站牌 (Autocomplete)
 app.get("/api/search-stop", async (req, res) => {
   const { q = "", city = "Taipei" } = req.query;
-  const name = q.trim();
-
-  if (name.length === 0)
-    return res.status(400).json({ error: "q is required" });
-
   try {
-    const tok   = await getToken();
-    const stops = await searchStopsByName(city, name, tok);
-
-    // 去重：同站名只留一筆
+    const tok = await getToken();
+    const stops = await searchStopsByName(city, q, tok);
+    
     const seen = new Set();
     const results = [];
     for (const s of stops) {
-      const stopName = s.StopName?.Zh_tw ?? "";
-      if (!stopName || seen.has(stopName)) continue;
-      seen.add(stopName);
-      results.push({
-        stopName,
-        stopUID:  s.StopUID ?? "",
-        city,
-      });
+      const name = s.StopName?.Zh_tw;
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      results.push({ stopName: name, city });
     }
-
-    res.json({ results, q, city });
+    res.json({ results });
   } catch (err) {
-    console.error("[search-stop]", err.response?.status, err.message);
-    res.status(500).json({ error: "站牌查詢失敗", detail: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════
-// § 5  GET /api/bus-arrivals
-//   主查詢：搭車站名 + 目的地關鍵字
-//   Query: stopName=台北車站, keyword=松山, city=Taipei
-// ═══════════════════════════════════════════════
+// 主查詢：搭車站名 + 目的地
 app.get("/api/bus-arrivals", async (req, res) => {
   const { stopName, keyword, city = "Taipei" } = req.query;
-
-  if (!stopName || !keyword)
-    return res.status(400).json({ error: "stopName and keyword are required" });
+  if (!stopName || !keyword) return res.status(400).json({ error: "缺少參數" });
 
   try {
     const tok = await getToken();
 
-    // ── A: 找出所有符合站名的 StopUID ──────────
+    // A. 找出所有符合的 StopUID
     const stops = await searchStopsByName(city, stopName.trim(), tok);
+    if (stops.length === 0) return res.json({ routes: [], hint: "找不到站牌" });
 
-    if (stops.length === 0) {
-      return res.json({
-        routes: [], stopName, keyword,
-        hint: `找不到「${stopName}」，請確認站名（支援模糊搜尋，例如輸入「台北」）`,
-      });
-    }
+    const stopUIDs = [...new Set(stops.map(s => s.StopUID))].slice(0, 10);
 
-    // 取前 5 個 StopUID（同站名可能有多個方向）
-    const stopUIDs = [...new Set(stops.map(s => s.StopUID))].slice(0, 5);
-    console.log(`[bus-arrivals] stopName=${stopName}, UIDs=${stopUIDs.join(",")}`);
+    // B. 批次抓取 ETA
+    const allETA = await fetchETAByBatch(city, stopUIDs, tok);
+    if (allETA.length === 0) return res.json({ routes: [], hint: "目前無即時到站資料" });
 
-    // ── B: 並行查所有 StopUID 的 ETA ───────────
-    const etaResults = await Promise.allSettled(
-      stopUIDs.map(uid => fetchETAByUID(city, uid, tok))
-    );
-
-    // 合併所有 ETA 資料
-    const allETA = [];
-    for (const r of etaResults) {
-      if (r.status === "fulfilled" && Array.isArray(r.value)) {
-        allETA.push(...r.value);
-      }
-    }
-
-    if (allETA.length === 0) {
-      return res.json({ routes: [], stopName, keyword, hint: "此站目前無公車資料" });
-    }
-
-    // ── C: 整理 routeMap（每條路線保留最小 ETA）
+    // C. 整理 RouteMap
     const routeMap = new Map();
-
     for (const item of allETA) {
       const rName = item.RouteName?.Zh_tw;
+      const eta = item.EstimateTime;
       if (!rName) continue;
 
-      const dir = item.Direction ?? 0;
-      const key = `${rName}:${dir}`;
-      const eta = item.EstimateTime ?? null;
-
+      const key = `${rName}:${item.Direction}`;
       const prev = routeMap.get(key);
       if (!prev || (eta !== null && (prev.etaSec === null || eta < prev.etaSec))) {
-        routeMap.set(key, {
-          routeUID:  item.RouteUID ?? rName,
-          routeName: rName,
-          direction: dir === 0 ? "去程" : "返程",
-          dirLabel:  item.DestinationStopName?.Zh_tw
-            ? `往 ${item.DestinationStopName.Zh_tw}`
-            : (dir === 0 ? "去程" : "返程"),
-          etaSec:    eta,
-          etaMin:    eta !== null ? Math.ceil(eta / 60) : null,
-          plateNumb: item.PlateNumb ?? null,
+        routeMap.set(key, { 
+          routeName: rName, 
+          direction: item.Direction, 
+          etaSec: eta, 
+          etaMin: eta !== null ? Math.floor(eta / 60) : null 
         });
       }
     }
 
-    if (routeMap.size === 0)
-      return res.json({ routes: [], stopName, keyword });
-
-    // ── D: StopOfRoute 並行查詢（比對目的地）──
-    const entries     = [...routeMap.values()];
+    // D. 並行比對目的地 (StopOfRoute)
+    const entries = [...routeMap.values()];
     const uniqueNames = [...new Set(entries.map(e => e.routeName))];
-
-    const sorResults = await Promise.allSettled(
-      uniqueNames.map(n => fetchStopOfRoute(city, n, tok))
-    );
+    const sorResults = await Promise.allSettled(uniqueNames.map(n => fetchStopOfRoute(city, n, tok)));
 
     const nameMap = new Map();
-    for (let i = 0; i < uniqueNames.length; i++) {
-      const r = sorResults[i];
-      if (r.status !== "fulfilled") continue;
-      const s = new Set();
-      for (const sub of r.value ?? []) {
-        for (const stop of sub.Stops ?? []) {
-          const n = stop.StopName?.Zh_tw ?? "";
-          if (n) s.add(n);
-        }
+    sorResults.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        const stopSet = new Set();
+        r.value.forEach(sub => sub.Stops?.forEach(st => stopSet.add(st.StopName.Zh_tw)));
+        nameMap.set(uniqueNames[i], stopSet);
       }
-      nameMap.set(uniqueNames[i], s);
-    }
+    });
 
-    // ── E: 合併 + keyword 比對 ─────────────────
+    // E. 合併結果與排序
     const kw = keyword.trim();
+    const finalRoutes = entries.map(e => {
+      const stopsOnRoute = nameMap.get(e.routeName) || new Set();
+      const hasDest = [...stopsOnRoute].some(n => n.includes(kw));
+      return { ...e, hasDestination: hasDest };
+    }).sort((a, b) => (b.hasDestination - a.hasDestination) || (a.etaMin - b.etaMin));
 
-    const routes = entries.map(e => {
-      const names           = nameMap.get(e.routeName) ?? new Set();
-      const hasDestination  = [...names].some(n => n.includes(kw));
-      const destinationStop = hasDestination
-        ? ([...names].find(n => n.includes(kw)) ?? null)
-        : null;
-
-      return {
-        routeUID:       e.routeUID,
-        routeName:      e.routeName,
-        direction:      e.direction,
-        directionLabel: e.dirLabel,
-        etaMin:         e.etaMin,
-        plateNumb:      e.plateNumb,
-        hasDestination,
-        destinationStop,
-      };
-    });
-
-    // ── F: 排序（有目的地優先，ETA 小到大）────
-    routes.sort((a, b) => {
-      if (a.hasDestination !== b.hasDestination) return a.hasDestination ? -1 : 1;
-      if (a.etaMin === null && b.etaMin === null) return 0;
-      if (a.etaMin === null) return 1;
-      if (b.etaMin === null) return -1;
-      return a.etaMin - b.etaMin;
-    });
-
-    res.json({ routes, stopName, keyword, total: routes.length });
+    res.json({ routes: finalRoutes, stopName, keyword });
 
   } catch (err) {
-    console.error("[bus-arrivals]", err.response?.status, err.message);
-    res.status(500).json({ error: "TDX 錯誤", detail: err.message });
+    console.error(err);
+    res.status(500).json({ error: "查詢失敗", detail: err.message });
   }
 });
 
-// ═══════════════════════════════════════════════
-// § 6  Health checks
-// ═══════════════════════════════════════════════
-app.get("/health", (_, res) =>
-  res.json({ ok: true, uptime: Math.round(process.uptime()), ts: new Date() })
-);
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/health/token", async (_, res) => {
-  try {
-    const tok = await getToken();
-    res.json({ ok: true, tokenLength: tok.length });
-  } catch (e) {
-    res.status(500).json({ ok: false, detail: e.message });
-  }
-});
-
-// ── 診斷端點 ──────────────────────────────────
-app.get("/debug/stop", async (req, res) => {
-  const { city = "Taipei" } = req.query;
-  try {
-    const tok = await getToken();
-    const url = `${TDX_BUS}/Stop/City/${city}?$top=3&$format=JSON`;
-    const { data } = await axios.get(url, { headers: auth(tok) });
-    res.json({ count: data.length, sample: data.slice(0, 2) });
-  } catch(e) {
-    res.json({ error: e.message, status: e.response?.status });
-  }
-});
-
-app.get("/debug/eta", async (req, res) => {
-  const { uid = "TPE10000", city = "Taipei" } = req.query;
-  try {
-    const tok = await getToken();
-    const url = `${TDX_BUS}/EstimatedTimeOfArrival/City/${city}/StopUID/${uid}?$top=3&$format=JSON`;
-    const { data } = await axios.get(url, { headers: auth(tok) });
-    res.json({ uid, count: Array.isArray(data) ? data.length : "not_array", sample: Array.isArray(data) ? data.slice(0,2) : data });
-  } catch(e) {
-    res.json({ error: e.message, status: e.response?.status, body: e.response?.data });
-  }
-});
-
-app.listen(PORT, () =>
-  console.log(`🚌 BusGo v3 → http://localhost:${PORT}`)
-);
+app.listen(PORT, () => console.log(`🚌 BusGo Backend v3 running on port ${PORT}`));
